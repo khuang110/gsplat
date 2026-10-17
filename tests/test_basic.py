@@ -5613,6 +5613,26 @@ def _clone_rasterization_scene(scene: dict) -> dict:
     }
 
 
+def _scene_at_batch(scene: dict, batch_id: int, batch_size: int) -> dict:
+    """Slice a batched scene dict to one batch element, leaving scalars intact."""
+    shared_sh = {
+        name
+        for name, degree in (
+            ("colors", "sh_degree"),
+            ("extra_signals", "extra_signals_sh_degree"),
+        )
+        if scene.get(degree) is not None and scene[name].ndim == 3
+    }
+    return {
+        name: value[batch_id]
+        if isinstance(value, torch.Tensor)
+        and value.shape[:1] == (batch_size,)
+        and name not in shared_sh
+        else value
+        for name, value in scene.items()
+    }
+
+
 def _assert_public_rasterization_grad_close(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -5755,6 +5775,130 @@ def test_rasterization_cpp_classic_sh_backward_matches_python_reference(packed: 
     for name, actual, expected in zip(grad_names, public_grads, ref_grads):
         assert expected.abs().sum() > 0, f"{name}: reference gradient is zero"
         _assert_public_rasterization_grad_close(actual, expected, name=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_3dgs(), reason="3DGS support isn't built in")
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "dense"])
+def test_rasterization_batch_boundary_gradients_match_serial(packed: bool):
+    """Gradients of scene b in a batch must equal scene b rendered alone.
+
+    Regression test for the projection backward warp reductions. With few
+    Gaussians per scene a warp straddles scene boundaries, and a reduction keyed
+    on the gaussian id or camera id alone (without the batch id) merges
+    gradients across scenes. One camera per scene makes every camera id 0,
+    the worst case for the viewmat reduction. Plain RGB colors keep the check
+    independent of SH.
+    """
+    torch.manual_seed(27)
+    n_batches = 3
+    scene = _make_cpp_classic_rasterization_scene(
+        batch_dims=(n_batches,), n_gaussians=24, n_cameras=1
+    )
+    grad_names = ("means", "quats", "scales", "viewmats")
+    _set_rasterization_scene_requires_grad(scene, grad_names)
+    kwargs = {
+        "width": 32,
+        "height": 32,
+        "tile_size": 16,
+        "render_mode": "RGB",
+        "rasterize_mode": "classic",
+        "packed": packed,
+    }
+
+    batched_colors, batched_alphas, _ = gsplat.rasterization(**scene, **kwargs)
+    v_colors, v_alphas = _classic_rasterization_loss_terms(
+        batched_colors, batched_alphas
+    )
+    batched_gradients = torch.autograd.grad(
+        (batched_colors * v_colors).sum() + (batched_alphas * v_alphas).sum(),
+        tuple(scene[name] for name in grad_names),
+    )
+
+    serial_gradients = []
+    for batch_id in range(n_batches):
+        serial_scene = _clone_rasterization_scene(
+            _scene_at_batch(scene, batch_id, n_batches)
+        )
+        _set_rasterization_scene_requires_grad(serial_scene, grad_names)
+        serial_colors, serial_alphas, _ = gsplat.rasterization(**serial_scene, **kwargs)
+        serial_gradients.append(
+            torch.autograd.grad(
+                (serial_colors * v_colors[batch_id]).sum()
+                + (serial_alphas * v_alphas[batch_id]).sum(),
+                tuple(serial_scene[name] for name in grad_names),
+            )
+        )
+
+    for name, batched_gradient, serial_gradient in zip(
+        grad_names, batched_gradients, zip(*serial_gradients)
+    ):
+        expected = torch.stack(serial_gradient)
+        assert expected.abs().sum() > 0, f"{name}: serial gradient is zero"
+        _assert_public_rasterization_grad_close(
+            batched_gradient, expected, name=name, rtol=1e-4, atol=1e-4
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+@pytest.mark.skipif(not gsplat.has_2dgs(), reason="2DGS support isn't built in")
+@pytest.mark.parametrize("packed", [True, False], ids=["packed", "dense"])
+def test_rasterization_2dgs_batch_boundary_gradients_match_serial(packed: bool):
+    """2DGS counterpart of the batch-boundary gradient regression test.
+
+    The 2DGS path hands post-activation colors straight to the rasterizer, so
+    per-Gaussian [..., N, D] colors are not accepted there; shared [N, K, D] SH
+    coefficients are evaluated per view instead. Only the Gaussian and camera
+    gradients are compared, since shared coefficients sum over scenes.
+    """
+    torch.manual_seed(28)
+    n_batches = 3
+    scene = _make_cpp_classic_rasterization_scene(
+        batch_dims=(n_batches,), n_gaussians=24, n_cameras=1, use_color_sh=True
+    )
+    # rasterization_2dgs has no extra-signal arguments.
+    scene = {
+        name: value
+        for name, value in scene.items()
+        if name not in ("extra_signals", "extra_signals_sh_degree")
+    }
+    grad_names = ("means", "quats", "scales", "viewmats")
+    _set_rasterization_scene_requires_grad(scene, grad_names)
+    kwargs = {"width": 32, "height": 32, "tile_size": 16, "packed": packed}
+
+    batched = gsplat.rasterization_2dgs(**scene, **kwargs)
+    batched_colors, batched_alphas = batched[0], batched[1]
+    v_colors, v_alphas = _classic_rasterization_loss_terms(
+        batched_colors, batched_alphas
+    )
+    batched_gradients = torch.autograd.grad(
+        (batched_colors * v_colors).sum() + (batched_alphas * v_alphas).sum(),
+        tuple(scene[name] for name in grad_names),
+    )
+
+    serial_gradients = []
+    for batch_id in range(n_batches):
+        serial_scene = _clone_rasterization_scene(
+            _scene_at_batch(scene, batch_id, n_batches)
+        )
+        _set_rasterization_scene_requires_grad(serial_scene, grad_names)
+        serial = gsplat.rasterization_2dgs(**serial_scene, **kwargs)
+        serial_gradients.append(
+            torch.autograd.grad(
+                (serial[0] * v_colors[batch_id]).sum()
+                + (serial[1] * v_alphas[batch_id]).sum(),
+                tuple(serial_scene[name] for name in grad_names),
+            )
+        )
+
+    for name, batched_gradient, serial_gradient in zip(
+        grad_names, batched_gradients, zip(*serial_gradients)
+    ):
+        expected = torch.stack(serial_gradient)
+        assert expected.abs().sum() > 0, f"{name}: serial gradient is zero"
+        _assert_public_rasterization_grad_close(
+            batched_gradient, expected, name=name, rtol=1e-4, atol=1e-4
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
